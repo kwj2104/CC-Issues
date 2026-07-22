@@ -116,6 +116,26 @@ def f_demand(reactions_total: int, labels: set, demand_cfg: dict) -> float:
     return 0.0
 
 
+def compute_rate_score(reactions_total: int, comments: int, age: float,
+                       f_severity: float, cluster_size: int, weights: dict) -> float:
+    """rev 6: age-corrected score. Engagement enters as monthly *rates*, not raw
+    totals (raw reactions skew mechanically with age), and there is no demand term.
+
+    rate_score = w.reactions*log2(1 + 30*reactions/age)
+               + w.comments*log2(1 + 30*comments/age)
+               + w.severity*severity
+               + w.cluster*log2(cluster_size or 1)
+    """
+    react_rate = math.log2(1 + 30.0 * reactions_total / age)
+    comm_rate = math.log2(1 + 30.0 * comments / age)
+    return (
+        weights["reactions"] * react_rate
+        + weights["comments"] * comm_rate
+        + weights["severity"] * f_severity
+        + weights["cluster"] * math.log2(cluster_size or 1)
+    )
+
+
 _MAINTAINER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 
 
@@ -158,6 +178,7 @@ def run_features(conn: sqlite3.Connection, cfg: dict) -> int:
     exclude = set(cfg["selection"]["exclude_labels"])
     exclude_lock = set(cfg["selection"].get("exclude_lock_reasons", []))
     junk_cfg = cfg["selection"]["junk_filter"]
+    stale_rescue_min = cfg["selection"].get("stale_rescue_min_reactions")
 
     # Preload labels per issue.
     labels_by_number: dict[int, set] = {}
@@ -192,23 +213,54 @@ def run_features(conn: sqlite3.Connection, cfg: dict) -> int:
         # Maintainers' own lifecycle labels (via exclude_labels) define staleness;
         # window_variants are explored only inside the sensitivity report.
         in_pool = 1
+        # rev 6 stale rescue: `stale` stops excluding at >= N reactions,
+        # mirroring the repo sweep's own STALE_UPVOTE_THRESHOLD exemption.
+        bad_labels = labels & exclude
+        if (stale_rescue_min is not None and "stale" in bad_labels
+                and r["reactions_total"] >= stale_rescue_min):
+            bad_labels = bad_labels - {"stale"}
         lock_reason = (r["active_lock_reason"] or "").lower()
         eligible = int(
             bool(in_pool)
-            and not (labels & exclude)
+            and not bad_labels
             and lock_reason not in exclude_lock
             and not is_junk
         )
 
+        # rate_score needs cluster_size (known only after clustering); it is
+        # filled by compute_rate_scores() and stored 0.0 as a placeholder here.
         inserts.append(
-            (number, age, fr, fc, fv, fs, fd, is_junk, maintainer, in_pool, eligible)
+            (number, age, fr, fc, fv, fs, fd, 0.0, is_junk, maintainer,
+             in_pool, eligible)
         )
 
     conn.executemany(
         "INSERT INTO features (number, age_days, f_reactions, f_comments, "
-        "f_velocity, f_severity, f_demand, is_junk, maintainer_authored, "
-        "in_pool, eligible) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "f_velocity, f_severity, f_demand, rate_score, is_junk, "
+        "maintainer_authored, in_pool, eligible) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         inserts,
     )
     conn.commit()
     return len(inserts)
+
+
+def compute_rate_scores(conn: sqlite3.Connection, cfg: dict) -> int:
+    """Fill features.rate_score once clusters exist. Returns row count."""
+    weights = cfg["weights"]
+    rows = conn.execute(
+        "SELECT f.number, i.reactions_total, i.comments, f.age_days, "
+        "f.f_severity, c.cluster_size "
+        "FROM features f JOIN issues i ON i.number = f.number "
+        "JOIN clusters c ON c.number = f.number"
+    ).fetchall()
+    updates = [
+        (
+            compute_rate_score(r["reactions_total"], r["comments"], r["age_days"],
+                               r["f_severity"], r["cluster_size"], weights),
+            r["number"],
+        )
+        for r in rows
+    ]
+    conn.executemany("UPDATE features SET rate_score = ? WHERE number = ?", updates)
+    conn.commit()
+    return len(updates)

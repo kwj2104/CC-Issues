@@ -6,11 +6,12 @@ import csv
 import os
 import random
 import sqlite3
+import statistics
 
 from . import config as config_mod
 from . import db
 from .features import _parse_iso_epoch
-from .score import _load_scored_rows, _rank_and_select
+from .score import _load_scored_rows, _rank_and_select, compile_filter
 
 REPORTS_DIR = "reports"
 
@@ -55,11 +56,13 @@ def _dist(counter: dict, keys) -> str:
 # --- exclusion waterfall ---------------------------------------------------
 
 
-def _exclusion_waterfall(pool, labels_by, cfg, total_open) -> list[tuple]:
-    """Sequential funnel: (step, removed, remaining), each step <= previous.
+def _exclusion_waterfall(pool, labels_by, cfg, total_open, reactions_by, stale_min):
+    """Sequential funnel; returns (steps, stale_rescued).
 
-    Starts from the in_pool set and removes, in order, each excluded label,
-    then excluded lock reasons, then junk. Final remaining == eligible count.
+    Each step is (name, removed, remaining), monotone non-increasing. The
+    `stale` step removes only issues NOT rescued by the stale-upvote exemption
+    (label `stale` stops excluding at >= stale_min reactions); the rescued count
+    is returned separately. Final remaining == the features-table eligible count.
     """
     exclude_labels = cfg["selection"]["exclude_labels"]
     exclude_lock = set(cfg["selection"].get("exclude_lock_reasons", []))
@@ -70,9 +73,16 @@ def _exclusion_waterfall(pool, labels_by, cfg, total_open) -> list[tuple]:
         ("open snapshot", total_open - total_open, total_open),
         ("in_pool", total_open - len(remaining), len(remaining)),
     ]
+    stale_rescued = 0
 
     for label in exclude_labels:
-        removed = {n for n in remaining if label in labels_by.get(n, set())}
+        if label == "stale" and stale_min is not None:
+            has_stale = {n for n in remaining if "stale" in labels_by.get(n, set())}
+            rescued = {n for n in has_stale if reactions_by.get(n, 0) >= stale_min}
+            stale_rescued = len(rescued)
+            removed = has_stale - rescued
+        else:
+            removed = {n for n in remaining if label in labels_by.get(n, set())}
         remaining -= removed
         steps.append((f"exclude label: {label}", len(removed), len(remaining)))
 
@@ -88,7 +98,63 @@ def _exclusion_waterfall(pool, labels_by, cfg, total_open) -> list[tuple]:
     steps.append(("junk filter", len(removed), len(remaining)))
 
     steps.append(("eligible", 0, len(remaining)))
-    return steps
+    return steps, stale_rescued
+
+
+# --- lane diagnostics (rev 6) ----------------------------------------------
+
+
+def _lane_diagnostics(conn, cfg, run_id):
+    """Per-lane fills/medians + a lane-filter overlap matrix. Returns (md, csv)."""
+    sel = conn.execute(
+        "SELECT s.number, s.selection_lane, f.age_days, f.rate_score, "
+        "f.f_severity, c.cluster_size, i.reactions_total "
+        "FROM scores s JOIN features f ON f.number = s.number "
+        "JOIN clusters c ON c.number = s.number "
+        "JOIN issues i ON i.number = s.number "
+        "WHERE s.run_id = ? AND s.selected = 1",
+        (run_id,),
+    ).fetchall()
+    rows = [dict(r) for r in sel]
+
+    lane_names = [lane["name"] for lane in cfg["selection"]["lanes"]]
+    spill_names = sorted({
+        r["selection_lane"] for r in rows
+        if r["selection_lane"] and r["selection_lane"].startswith("spill:")
+    })
+    order = lane_names + spill_names
+    by_lane = {name: [r for r in rows if r["selection_lane"] == name]
+               for name in order}
+
+    md = ["", "## Per-lane composition", "",
+          "| lane | fill | median age_days | median rate_score | median severity |",
+          "|---|---|---|---|---|"]
+    csv_rows = []
+    for name in order:
+        g = by_lane.get(name, [])
+        if not g:
+            md.append(f"| {name} | 0 | - | - | - |")
+            csv_rows.append(("lane_fill", name, 0))
+            continue
+        ma = statistics.median([x["age_days"] for x in g])
+        mr = statistics.median([x["rate_score"] for x in g])
+        ms = statistics.median([x["f_severity"] for x in g])
+        md.append(f"| {name} | {len(g)} | {ma:.1f} | {mr:.2f} | {ms:.2f} |")
+        csv_rows.append(("lane_fill", name, len(g)))
+
+    lanes = cfg["selection"]["lanes"]
+    preds = {lane["name"]: compile_filter(lane.get("filter")) for lane in lanes}
+    header = " | ".join(lane["name"] for lane in lanes)
+    md += ["", "## Lane overlap matrix",
+           "Rows = assigned lane; columns = how many of those rows also pass each "
+           "lane's filter.", "",
+           f"| assigned \\\\ passes | {header} |",
+           "|" + "---|" * (len(lanes) + 1)]
+    for name in order:
+        g = by_lane.get(name, [])
+        cells = [str(sum(1 for r in g if preds[lane["name"]](r))) for lane in lanes]
+        md.append(f"| {name} | " + " | ".join(cells) + " |")
+    return md, csv_rows
 
 
 # --- composition -----------------------------------------------------------
@@ -117,7 +183,11 @@ def _composition(conn, cfg, run_id, out_dir) -> None:
     selected = [r for r in eligible if r["number"] in selected_numbers]
 
     total_open = conn.execute("SELECT COUNT(*) AS n FROM issues").fetchone()["n"]
-    waterfall = _exclusion_waterfall(pool, labels_by, cfg, total_open)
+    reactions_by = {r["number"]: r["reactions_total"] for r in pool}
+    stale_min = cfg["selection"].get("stale_rescue_min_reactions")
+    waterfall, stale_rescued = _exclusion_waterfall(
+        pool, labels_by, cfg, total_open, reactions_by, stale_min
+    )
     # rev 3: no window -> pool is every open issue; carve-out no longer exists.
     maintainer_in_top = conn.execute(
         "SELECT COUNT(*) AS n FROM scores s JOIN features f ON f.number = s.number "
@@ -207,6 +277,9 @@ def _composition(conn, cfg, run_id, out_dir) -> None:
         pure_engagement_note,
         "## Exclusion waterfall",
         "",
+        f"- **stale rescued** (kept despite `stale`, >= {stale_min} reactions): "
+        f"**{stale_rescued}**",
+        "",
         "| step | removed | remaining |",
         "|---|---|---|",
         *[f"| {name} | {removed} | {remaining} |"
@@ -248,6 +321,18 @@ def _composition(conn, cfg, run_id, out_dir) -> None:
     for d in range(10):
         lines.append(f"| {d} | {sel_deciles.get(d, 0)} |")
 
+    # rev 6: lane diagnostics + Jaccard vs the old single-score head.
+    lane_md, lane_csv = _lane_diagnostics(conn, cfg, run_id)
+    lines += lane_md
+
+    scored = _load_scored_rows(conn, cfg["weights"])
+    _, old_selected = _rank_and_select(scored, cfg["selection"]["top_n"])
+    old_head = {r["number"] for r in old_selected}
+    jac = _jaccard(old_head, selected_numbers)
+    lines += ["", "## Head vs single-score baseline", "",
+              f"- Jaccard(lane head, single-score head) = **{jac:.3f}** "
+              f"({len(old_head & selected_numbers)} shared of {len(selected_numbers)})"]
+
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "composition.md"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -261,9 +346,13 @@ def _composition(conn, cfg, run_id, out_dir) -> None:
         w.writerow(["eligible", "", len(eligible)])
         w.writerow(["selected", "", len(selected)])
         w.writerow(["maintainer_in_top", "", maintainer_in_top])
+        w.writerow(["stale_rescued", "", stale_rescued])
+        w.writerow(["jaccard_vs_single_score", "", f"{jac:.4f}"])
         for name, removed, remaining in waterfall:
             w.writerow(["waterfall_remaining", name, remaining])
             w.writerow(["waterfall_removed", name, removed])
+        for metric, key, value in lane_csv:
+            w.writerow([metric, key, value])
         for k in age_keys:
             w.writerow(["age_pool", k, pb.get(k, 0)])
             w.writerow(["age_selected", k, sb.get(k, 0)])

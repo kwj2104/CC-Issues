@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS features (
   f_velocity  REAL NOT NULL,       -- log2(1 + 30*(reactions_total+comments)/age_days)
   f_severity  REAL NOT NULL,       -- per section 5, capped
   f_demand    REAL NOT NULL,       -- per section 5
+  rate_score  REAL NOT NULL DEFAULT 0,  -- rev 6: age-corrected score (set after clustering)
   is_junk            INTEGER NOT NULL,  -- abandoned empty report (all junk conds hold)
   maintainer_authored INTEGER NOT NULL, -- author is OWNER/MEMBER/COLLABORATOR (flag only)
   in_pool  INTEGER NOT NULL,       -- rev 3: always 1 (baseline = every open issue)
@@ -64,8 +65,9 @@ CREATE TABLE IF NOT EXISTS scores (
   score REAL NOT NULL,
   c_reactions REAL NOT NULL, c_comments REAL NOT NULL, c_velocity REAL NOT NULL,
   c_severity REAL NOT NULL, c_demand REAL NOT NULL, c_cluster REAL NOT NULL,
-  rank INTEGER,                    -- rank among eligible, 1-based; NULL if ineligible
+  rank INTEGER,                    -- global score-rank among eligible, 1-based; NULL if ineligible
   selected INTEGER NOT NULL DEFAULT 0,
+  selection_lane TEXT,             -- rev 6: lane name or spill:<source>; NULL if not selected
   PRIMARY KEY (run_id, number)
 );
 """
@@ -97,6 +99,10 @@ _ADDED_COLUMNS = {
     "features": [
         ("is_junk", "INTEGER NOT NULL DEFAULT 0"),
         ("maintainer_authored", "INTEGER NOT NULL DEFAULT 0"),
+        ("rate_score", "REAL NOT NULL DEFAULT 0"),
+    ],
+    "scores": [
+        ("selection_lane", "TEXT"),
     ],
 }
 

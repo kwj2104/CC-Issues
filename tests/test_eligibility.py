@@ -139,25 +139,30 @@ def test_normal_issue_eligible(crafted):
 def _pool_and_labels(conn):
     pool = conn.execute(
         """
-        SELECT i.number, i.active_lock_reason, f.is_junk, f.eligible
+        SELECT i.number, i.reactions_total, i.active_lock_reason, f.is_junk,
+               f.eligible
         FROM issues i JOIN features f ON f.number = i.number WHERE f.in_pool = 1
         """
     ).fetchall()
     labels_by: dict[int, set] = {}
     for r in conn.execute("SELECT number, label FROM issue_labels"):
         labels_by.setdefault(r["number"], set()).add(r["label"])
-    return pool, labels_by
+    reactions_by = {r["number"]: r["reactions_total"] for r in pool}
+    return pool, labels_by, reactions_by
+
+
+def _waterfall(conn, cfg):
+    pool, labels_by, reactions_by = _pool_and_labels(conn)
+    total_open = conn.execute("SELECT COUNT(*) AS n FROM issues").fetchone()["n"]
+    stale_min = cfg["selection"].get("stale_rescue_min_reactions")
+    return _exclusion_waterfall(pool, labels_by, cfg, total_open, reactions_by,
+                                stale_min)
 
 
 def test_waterfall_monotonic_and_matches_eligible(crafted, cfg):
-    pool, labels_by = _pool_and_labels(crafted)
-    total_open = crafted.execute("SELECT COUNT(*) AS n FROM issues").fetchone()["n"]
-    steps = _exclusion_waterfall(pool, labels_by, cfg, total_open)
-
+    steps, _ = _waterfall(crafted, cfg)
     remainings = [remaining for _, _, remaining in steps]
-    # every step's remaining must be <= the previous step's remaining
     assert all(b <= a for a, b in zip(remainings, remainings[1:]))
-
     eligible_count = crafted.execute(
         "SELECT COUNT(*) AS n FROM features WHERE eligible = 1"
     ).fetchone()["n"]
@@ -166,9 +171,7 @@ def test_waterfall_monotonic_and_matches_eligible(crafted, cfg):
 
 
 def test_waterfall_on_full_fixture(loaded, cfg):
-    pool, labels_by = _pool_and_labels(loaded)
-    total_open = loaded.execute("SELECT COUNT(*) AS n FROM issues").fetchone()["n"]
-    steps = _exclusion_waterfall(pool, labels_by, cfg, total_open)
+    steps, _ = _waterfall(loaded, cfg)
     eligible_count = loaded.execute(
         "SELECT COUNT(*) AS n FROM features WHERE eligible = 1"
     ).fetchone()["n"]

@@ -42,9 +42,10 @@ def conn(cfg):
 
 @pytest.fixture
 def loaded(conn, cfg):
-    """DB with features + clusters computed."""
+    """DB with features + clusters + rate_score computed."""
     from retrieval import cluster, features
 
     features.run_features(conn, cfg)
     cluster.run_clustering(conn, cfg)
+    features.compute_rate_scores(conn, cfg)
     return conn

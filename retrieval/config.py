@@ -43,8 +43,26 @@ def validate_config(cfg: dict) -> None:
         if not isinstance(weights[k], (int, float)):
             raise ValueError(f"weights.{k} must be numeric")
 
-    if cfg["selection"]["top_n"] <= 0:
+    sel = cfg["selection"]
+    if sel["top_n"] <= 0:
         raise ValueError("selection.top_n must be positive")
+    lanes = sel.get("lanes", [])
+    if not lanes:
+        raise ValueError("selection.lanes is required")
+    total_slots = 0
+    for lane in lanes:
+        for key in ("name", "slots", "rank_by"):
+            if key not in lane:
+                raise ValueError(f"lane missing '{key}': {lane}")
+        if not isinstance(lane["rank_by"], list) or not lane["rank_by"]:
+            raise ValueError(f"lane.rank_by must be a non-empty list: {lane}")
+        total_slots += lane["slots"]
+    if total_slots != sel["top_n"]:
+        raise ValueError(
+            f"lane slots sum to {total_slots}, must equal top_n {sel['top_n']}"
+        )
+    if "spill_order" not in sel:
+        raise ValueError("selection.spill_order is required")
     thr = cfg["clustering"]["similarity_threshold"]
     if not (0.0 < thr <= 1.0):
         raise ValueError("clustering.similarity_threshold must be in (0, 1]")

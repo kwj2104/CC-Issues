@@ -33,11 +33,18 @@ selection:
   top_n: 1000
   exclude_labels: [duplicate, invalid, stale, autoclose, question]
   exclude_lock_reasons: [spam, resolved]
+  stale_rescue_min_reactions: 10   # `stale` stops excluding at >= N reactions
   junk_filter:                 # excluded only if ALL conditions hold
     max_clean_body_chars: 40
     max_reactions: 0
     max_comments: 0
     min_age_days: 7
+  lanes:                       # processed in order; global dedup on number AND cluster_id
+    - {name: big-bets, slots: 350, rank_by: [score]}
+    - {name: emerging, slots: 350, filter: "age_days <= 30", rank_by: [rate_score]}
+    - {name: severity, slots: 200, filter: "severity >= 2.0", rank_by: [severity, rate_score]}
+    - {name: volume,   slots: 100, filter: "cluster_size >= 2", rank_by: [cluster_size, rate_score]}
+  spill_order: [emerging-rank, global-score]  # refill underfilled slots, skipping lane filters
 sensitivity:
   perturbation: 0.5           # +/-50% per weight
   window_variants: [90, 180]  # days-since-creation cutoffs, tested in-memory only

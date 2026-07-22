@@ -36,6 +36,7 @@ def cmd_migrate(conn, cfg):
 def cmd_features(conn, cfg):
     n = features.run_features(conn, cfg)
     k = cluster.run_clustering(conn, cfg)
+    features.compute_rate_scores(conn, cfg)  # needs cluster_size
     print(f"[features] computed features for {n} issues; {k} clusters")
 
 

@@ -1,5 +1,18 @@
-# plan.md — GitHub Issue Opportunity Retrieval (Stage 1) — rev 5
+# plan.md — GitHub Issue Opportunity Retrieval (Stage 1) — rev 6
 
+> **rev 6 delta (lane-based selection + filtration hardening).** Replaces the
+> flat single-score top-N with a declared **4-lane portfolio** (big-bets /
+> emerging / severity / volume, global dedup on number AND cluster_id, spill to
+> refill underfilled slots) and adds an age-corrected **`rate_score`** (monthly
+> engagement rates, no raw totals, no demand term). Stale rescue: `stale` stops
+> excluding at ≥10 reactions. Exports `reactions_plus1`, `rate_score`,
+> `selection_lane`. New diagnostics: per-lane composition, lane overlap matrix,
+> Jaccard vs the old single-score head, stale-rescued waterfall line. Ingest,
+> clustering, exclusion labels, junk filter, and the base `score` are unchanged.
+> Touches §3, §5, §7, §8, §9. (Numbering note: this is the "lane-based
+> selection" consolidated spec; it lands as rev 6 here because rev 4/5 banners
+> were already used for the cursor-pagination and count-tolerance infra fixes.)
+>
 > **rev 5 delta (count tolerance).** GitHub's search `total_count` is
 > approximate and ran ~2% above the actual open-issue list, so the ±1%
 > validation tolerance was unachievable on a *complete* ingest (it failed at
@@ -119,11 +132,18 @@ selection:
   top_n: 1000
   exclude_labels: [duplicate, invalid, stale, autoclose, question]
   exclude_lock_reasons: [spam, resolved]
+  stale_rescue_min_reactions: 10   # rev 6: `stale` stops excluding at >= N reactions
   junk_filter:              # excluded only if ALL conditions hold
     max_clean_body_chars: 40
     max_reactions: 0
     max_comments: 0
     min_age_days: 7
+  lanes:                    # rev 6: processed in order; global dedup on number AND cluster_id
+    - {name: big-bets, slots: 350, rank_by: [score]}
+    - {name: emerging, slots: 350, filter: "age_days <= 30", rank_by: [rate_score]}
+    - {name: severity, slots: 200, filter: "severity >= 2.0", rank_by: [severity, rate_score]}
+    - {name: volume,   slots: 100, filter: "cluster_size >= 2", rank_by: [cluster_size, rate_score]}
+  spill_order: [emerging-rank, global-score]   # refill underfilled slots, skipping lane filters
 sensitivity:
   perturbation: 0.5         # ±50% per weight
   window_variants: [90, 180] # rev 3: creation-day cutoffs, tested in-memory only
@@ -226,6 +246,10 @@ All formulas exact; `age_days = max(1.0, (snapshot_ts - created_at)/86400)` (flo
 - `f_severity = min(cap, Σ label_weights[matching labels] + (regex_bonus if regex matches else 0))` — regex is case-insensitive, applied to `title + " " + body_lead` (see text prep), added **at most once** regardless of match count.
 - `f_demand = log2(reactions_total)` if the issue has any demand label AND `reactions_total ≥ min_reactions`, else `0`.
 
+**`rate_score` (rev 6, age-corrected).** Persisted in `features` and both CSVs. Filled *after* clustering (it needs `cluster_size`):
+`rate_score = w.reactions*log2(1 + 30*reactions_total/age_days) + w.comments*log2(1 + 30*comments/age_days) + w.severity*Severity + w.cluster*log2(cluster_size or 1)`.
+Engagement enters as monthly **rates**, not raw totals, and there is no demand term — because raw reactions skew mechanically with age (pool median: 0 at ≤30d, 19 at >90d), so a raw-engagement ranking is really an age ranking.
+
 **Two computed flags (rev 2):**
 
 - `is_junk = 1` iff ALL hold: `len(clean_body) ≤ junk_filter.max_clean_body_chars (40)` AND `reactions_total ≤ max_reactions (0)` AND `comments ≤ max_comments (0)` AND `age_days ≥ min_age_days (7)`. `clean_body` is the **body portion** after the text-prep pipeline below (template/code/URL stripping), **without the title** and untruncated. Junk = an abandoned empty report: no body, no engagement, a week old.
@@ -260,15 +284,15 @@ score = w.reactions*f_reactions + w.comments*f_comments + w.velocity*f_velocity
 
 - Compute for **every** issue; store per-component contributions (`c_*` columns) for auditability.
 - `run_id = sha256(snapshot_ts + canonical_json(config))[:12]`; insert into `score_runs`. Same snapshot + same config → same `run_id` → re-run replaces that run idempotently. Changed weights → new run, old runs preserved (this is what makes sensitivity analysis and weight experiments comparable). The rev 2 config change alters the canonical config JSON → a **new `run_id`**; old runs stay in `score_runs`/`scores` (delete nothing), and reports use the new baseline run.
-- **Eligibility (rev 2):** `eligible = in_pool AND (no label ∈ exclude_labels) AND (active_lock_reason ∉ exclude_lock_reasons, compared lowercased) AND NOT is_junk`. Ineligible rows still receive scores and cluster membership and still appear in `ranked_pool.csv` and diagnostics — they simply cannot occupy a top-1,000 slot.
-- **Selection:** among `eligible` issues, rank by `score DESC`, tie-break `reactions_total DESC`, then `number DESC` (full determinism). Walk the ranking keeping only the **first (highest-scoring) eligible member of each cluster_id**; stop at `top_n`. Mark `selected=1`. Ineligible cluster members still contribute to `cluster_size` but never represent the cluster.
+- **Eligibility (rev 2 + rev 6 stale rescue):** `eligible = in_pool AND (no label ∈ exclude_labels) AND (active_lock_reason ∉ exclude_lock_reasons, compared lowercased) AND NOT is_junk`, **except** the `stale` label no longer excludes when `reactions_total ≥ stale_rescue_min_reactions` (mirrors the repo sweep's own STALE_UPVOTE_THRESHOLD exemption). Ineligible rows still receive scores and cluster membership and still appear in `ranked_pool.csv` and diagnostics — they simply cannot occupy a top-1,000 slot.
+- **Selection (rev 6: 4-lane portfolio).** Config declares ordered lanes summing to `top_n` slots. Process lanes in order: each lane filters `eligible` rows by its `filter`, ranks by its `rank_by` keys (all DESC) with universal tie-breaks `reactions_total DESC, number DESC`, and takes rows whose `number` **and** `cluster_id` are both unclaimed until its slots run out (global dedup across the whole head — one row per cluster). After all lanes, refill any unfilled slots per `spill_order` (`emerging-rank` = rank remaining eligible by `rate_score`; `global-score` = by `score`); **spill rows skip lane filters but never eligibility**. Every selected row is tagged `selection_lane` (lane name or `spill:<source>`).
 - Outputs:
-  - `out/top_1000.csv` — columns: `rank, number, html_url, title, created_at, updated_at, age_days, reactions_total, comments, maintainer_authored, labels` (`;`-joined), `cluster_id, cluster_size, cluster_members` (`;`-joined numbers, capped at 50), `score, c_reactions, c_comments, c_velocity, c_severity, c_demand, c_cluster, run_id, snapshot_ts`. (`maintainer_authored` added in rev 2.)
+  - `out/top_1000.csv` — columns: `rank, number, html_url, title, created_at, updated_at, age_days, reactions_total, reactions_plus1, comments, maintainer_authored, labels` (`;`-joined), `cluster_id, cluster_size, cluster_members` (`;`-joined numbers, capped at 50), `score, rate_score, selection_lane, c_reactions, c_comments, c_velocity, c_severity, c_demand, c_cluster, run_id, snapshot_ts`. (rev 2: `maintainer_authored`; rev 6: `reactions_plus1`, `rate_score`, `selection_lane`.)
   - `out/ranked_pool.csv` — same columns for every eligible issue.
 
 ## 8. M4 — Diagnostics (`report`)
 
-1. `reports/composition.md` (+ a machine-readable `.csv` twin): pool size and carve-out share; top-1,000 vs full-pool distributions of age buckets (≤7d, 8–30d, 31–90d, >90d), bug/enhancement/other label mix, top-15 `area:*` labels, engagement deciles; count of selected issues admitted **only** via carve-out. **(rev 2)** an **exclusion waterfall** with counts at every step: open snapshot → in_pool → after each `exclude_label` (count per label) → after lock-reason filter → after junk filter → eligible (each step's remaining ≤ the previous; final remaining = the features-table eligible count); plus the count of `maintainer_authored` rows inside the top 1,000.
+1. `reports/composition.md` (+ a machine-readable `.csv` twin): pool size; top-1,000 vs full-pool distributions of age buckets (≤7d, 8–30d, 31–90d, >90d), bug/enhancement/other label mix, top-15 `area:*` labels, engagement deciles. **(rev 2)** an **exclusion waterfall** with counts at every step: open snapshot → in_pool → after each `exclude_label` (count per label) → after lock-reason filter → after junk filter → eligible (each step's remaining ≤ the previous; final remaining = the features-table eligible count); plus the count of `maintainer_authored` rows inside the top 1,000. **(rev 6)** the waterfall's `stale` step shows only non-rescued removals and a separate **"stale rescued: N"** line; plus **per-lane composition** (fills incl. spill, and age/rate_score/severity medians per lane), a **lane overlap matrix** (for each selected row, which other lanes' filters it also passes), and the **Jaccard of this lane head vs the old single-score head** (computed in memory).
 2. `reports/sensitivity.md`, **(a) weight perturbation**: for each of the 6 weights, re-rank with that weight ×0.5 and ×1.5 (12 variants; selection re-run in memory, no DB writes) → table of Jaccard overlaps between each variant's top-1,000 and the baseline's. Include min/mean overlap headline. **(b) creation-window variants (rev 3):** re-run selection restricted to issues created within each `sensitivity.window_variants` value (90 and 180 days) of `snapshot_ts`; report the Jaccard overlap of each variant's top-1,000 against the **no-window baseline**. High overlap is the empirical proof that no window choice would have changed the selection.
 3. `reports/top20_preview.md`: rank, number, title, score components, link — the human sanity check before Stage 2 commits.
 4. `reports/cluster_qc.md`: per §6.5.
@@ -277,9 +301,9 @@ score = w.reactions*f_reactions + w.comments*f_comments + w.velocity*f_velocity
 
 1. `python -m retrieval all` completes against the live repo with only `GITHUB_TOKEN` set; ingest ≤ ~20 min, post-ingest ≤ 5 min, ≤ 2 GB RAM.
 2. Ingested row count within `ingest.count_tolerance` (rev 5: ±3%) of the search-API `total_count`; both values stored in `meta` and printed.
-3. `top_1000.csv` has exactly `top_n` rows; all `number`s unique; **at most one row per `cluster_id`**; every row is `state=open` (rev 3: replaces the former pool-predicate check). **(rev 2)** no selected row carries an excluded label, an excluded lock reason, or `is_junk = 1`.
+3. `top_1000.csv` has exactly `top_n` rows; all `number`s unique; **at most one row per `cluster_id`** across the whole head; every row is `state=open` (rev 3). **(rev 2)** no selected row carries an excluded label (rev 6: **except `stale`-rescued rows, which must have `reactions_total ≥ stale_rescue_min_reactions`**), an excluded lock reason, or `is_junk = 1`. **(rev 6)** lane fills + spill sum to `top_n`; every non-spill row satisfies its lane's filter; `selection_lane` is set on every selected row.
 4. Determinism: running `score` + `report` twice on the same DB and config produces byte-identical `top_1000.csv` (verify by hash in a test).
-5. Unit tests: text prep (fixture strings → expected clean output); each feature formula against hand-computed values on the ~30-row fixture; union-find clustering on a fixture with two known duplicate groups; selection logic incl. tie-breaks and cluster dedup; severity cap and regex once-only bonus. **(rev 2)** `is_junk` boundaries (clean_body 39/40/41 chars; age 6.9 vs 7.0; exactly 1 reaction or 1 comment is not junk); `maintainer_authored` mapping for each `author_association`; lock-reason exclusion (spam/resolved excluded; other/NULL kept); waterfall counts sum consistently (each step ≤ previous; eligible matches the features table); the determinism hash covers the new CSV column.
+5. Unit tests: text prep (fixture strings → expected clean output); each feature formula against hand-computed values on the ~30-row fixture; union-find clustering on a fixture with two known duplicate groups; selection logic incl. tie-breaks and cluster dedup; severity cap and regex once-only bonus. **(rev 2)** `is_junk` boundaries (clean_body 39/40/41 chars; age 6.9 vs 7.0; exactly 1 reaction or 1 comment is not junk); `maintainer_authored` mapping for each `author_association`; lock-reason exclusion (spam/resolved excluded; other/NULL kept); waterfall counts sum consistently (each step ≤ previous; eligible matches the features table); the determinism hash covers the new CSV column. **(rev 6)** `rate_score` hand-values; lane fill/ordering/spill incl. underfill; stale-rescue boundary (9 vs 10 reactions); `selection_lane` tagging; cross-lane cluster dedup; determinism hash updated for `rate_score`, `selection_lane`, `reactions_plus1`.
 6. All 12 sensitivity variants generated; `composition.md` renders with real numbers.
 7. `grep`-provable: no network access outside `ingest.py`; no LLM/API-model imports anywhere.
 

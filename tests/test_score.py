@@ -39,9 +39,15 @@ def test_highest_scoring_member_represents_cluster(loaded, cfg, tmp_path):
 def test_no_excluded_labels_selected(loaded, cfg, tmp_path):
     _run(loaded, cfg, tmp_path)
     exclude = set(cfg["selection"]["exclude_labels"])
+    stale_min = cfg["selection"]["stale_rescue_min_reactions"]
     for r in _read(tmp_path, "top_1000.csv"):
         labels = set(filter(None, r["labels"].split(";")))
-        assert not (labels & exclude)
+        bad = labels & exclude
+        # only `stale` may appear, and only on a stale-rescued row (>= threshold)
+        if bad:
+            assert bad == {"stale"}
+            assert int(r["reactions_total"]) >= stale_min
+
 
 
 def test_maintainer_authored_column_present(loaded, cfg, tmp_path):
