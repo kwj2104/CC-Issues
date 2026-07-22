@@ -1,0 +1,47 @@
+repo: anthropics/claude-code
+window:
+  created_days: 90            # pool: created within N days of snapshot_ts
+  carveout_updated_days: 45   # OR older but updated within N days
+  carveout_min_reactions: 25  # OR older but holding >= N reactions
+weights:
+  reactions: 3.0
+  comments: 1.0
+  velocity: 2.0
+  severity: 2.0
+  demand: 1.0
+  cluster: 2.0
+severity:
+  cap: 5.0
+  label_weights:              # matched against lowercased label names, exact
+    data-loss: 3.0
+    area:security: 2.0
+    regression: 2.0
+    high-priority: 2.0
+    perf:reliability: 1.5
+    med-priority: 1.0
+    "has repro": 0.5
+  regex_bonus: 1.0            # added at most once if any pattern matches title+body_lead
+  regex_bank: "crash|hang|freeze|data.?loss|corrupt|segfault|CVE-\\d{4}|after updat"
+demand:
+  labels: [enhancement, "feature request", feature]
+  min_reactions: 5
+clustering:
+  similarity_threshold: 0.6
+  ngram_range: [1, 2]
+  min_df: 2
+  max_df: 0.5
+  body_lead_chars: 1500
+selection:
+  top_n: 1000
+  exclude_labels: [duplicate, invalid, stale, autoclose, question]
+  exclude_lock_reasons: [spam, resolved]
+  junk_filter:                 # excluded only if ALL conditions hold
+    max_clean_body_chars: 40
+    max_reactions: 0
+    max_comments: 0
+    min_age_days: 7
+sensitivity:
+  perturbation: 0.5           # +/-50% per weight
+qc:
+  cluster_sample: 20
+  seed: 42
