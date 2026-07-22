@@ -9,7 +9,6 @@ import yaml
 
 REQUIRED_TOP_KEYS = {
     "repo",
-    "window",
     "weights",
     "severity",
     "demand",

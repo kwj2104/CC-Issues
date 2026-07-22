@@ -9,6 +9,7 @@ import sqlite3
 
 from . import config as config_mod
 from . import db
+from .features import _parse_iso_epoch
 from .score import _load_scored_rows, _rank_and_select
 
 REPORTS_DIR = "reports"
@@ -96,7 +97,6 @@ def _exclusion_waterfall(pool, labels_by, cfg, total_open) -> list[tuple]:
 def _composition(conn, cfg, run_id, out_dir) -> None:
     labels_by = _labels_by_number(conn)
     demand_labels = set(cfg["demand"]["labels"])
-    created_days = cfg["window"]["created_days"]
     snapshot_ts = db.get_meta(conn, "snapshot_ts")
 
     pool = conn.execute(
@@ -118,23 +118,12 @@ def _composition(conn, cfg, run_id, out_dir) -> None:
 
     total_open = conn.execute("SELECT COUNT(*) AS n FROM issues").fetchone()["n"]
     waterfall = _exclusion_waterfall(pool, labels_by, cfg, total_open)
+    # rev 3: no window -> pool is every open issue; carve-out no longer exists.
     maintainer_in_top = conn.execute(
         "SELECT COUNT(*) AS n FROM scores s JOIN features f ON f.number = s.number "
         "WHERE s.run_id = ? AND s.selected = 1 AND f.maintainer_authored = 1",
         (run_id,),
     ).fetchone()["n"]
-
-    # carve-out share: in pool but created outside the created_days window.
-    from .features import _parse_iso_epoch
-
-    snap_epoch = _parse_iso_epoch(snapshot_ts)
-
-    def carveout_only(r):
-        age_created = (snap_epoch - _parse_iso_epoch(r["created_at"])) / 86400.0
-        return age_created > created_days
-
-    pool_carveout = sum(1 for r in pool if carveout_only(r))
-    selected_carveout = sum(1 for r in selected if carveout_only(r))
 
     def bucket_counts(rows):
         c: dict[str, int] = {}
@@ -213,9 +202,6 @@ def _composition(conn, cfg, run_id, out_dir) -> None:
         f"- pool size (in_pool): **{len(pool)}**",
         f"- eligible (ranked pool): **{len(eligible)}**",
         f"- selected (top_n): **{len(selected)}**",
-        f"- carve-out share of pool: **{pool_carveout}** "
-        f"({pool_carveout / (len(pool) or 1):.1%})",
-        f"- selected admitted **only** via carve-out: **{selected_carveout}**",
         f"- maintainer-authored rows inside top_n: **{maintainer_in_top}** "
         f"(flag only; not excluded)",
         pure_engagement_note,
@@ -274,8 +260,6 @@ def _composition(conn, cfg, run_id, out_dir) -> None:
         w.writerow(["pool_size", "", len(pool)])
         w.writerow(["eligible", "", len(eligible)])
         w.writerow(["selected", "", len(selected)])
-        w.writerow(["pool_carveout", "", pool_carveout])
-        w.writerow(["selected_carveout", "", selected_carveout])
         w.writerow(["maintainer_in_top", "", maintainer_in_top])
         for name, removed, remaining in waterfall:
             w.writerow(["waterfall_remaining", name, remaining])
@@ -293,6 +277,22 @@ def _composition(conn, cfg, run_id, out_dir) -> None:
 # --- sensitivity -----------------------------------------------------------
 
 
+def _jaccard(a: set, b: set) -> float:
+    if not a and not b:
+        return 1.0
+    return len(a & b) / len(a | b)
+
+
+def select_within_window(scored, snap_epoch, window_days, top_n):
+    """Re-run selection restricted to issues created within `window_days`."""
+    subset = [
+        r for r in scored
+        if (snap_epoch - _parse_iso_epoch(r["created_at"])) / 86400.0 <= window_days
+    ]
+    _, selected = _rank_and_select(subset, top_n)
+    return selected
+
+
 def _sensitivity(conn, cfg, run_id, out_dir) -> None:
     weights = cfg["weights"]
     top_n = cfg["selection"]["top_n"]
@@ -302,11 +302,7 @@ def _sensitivity(conn, cfg, run_id, out_dir) -> None:
     _, base_selected = _rank_and_select(base_scored, top_n)
     base_set = {r["number"] for r in base_selected}
 
-    def jaccard(a: set, b: set) -> float:
-        if not a and not b:
-            return 1.0
-        return len(a & b) / len(a | b)
-
+    # (a) weight perturbation
     rows = []
     for key in config_mod.WEIGHT_KEYS:
         for factor, label in ((1 - pert, "x0.5"), (1 + pert, "x1.5")):
@@ -314,17 +310,30 @@ def _sensitivity(conn, cfg, run_id, out_dir) -> None:
             w[key] = weights[key] * factor
             scored = _load_scored_rows(conn, w)
             _, selected = _rank_and_select(scored, top_n)
-            j = jaccard(base_set, {r["number"] for r in selected})
-            rows.append((key, label, j))
+            rows.append((key, label, _jaccard(base_set, {r["number"] for r in selected})))
 
     overlaps = [j for _, _, j in rows]
     headline_min = min(overlaps) if overlaps else 1.0
     headline_mean = sum(overlaps) / len(overlaps) if overlaps else 1.0
 
+    # (b) creation-window variants (rev 3): does any calendar window change the pick?
+    snapshot_ts = db.get_meta(conn, "snapshot_ts")
+    snap_epoch = _parse_iso_epoch(snapshot_ts)
+    window_variants = cfg["sensitivity"].get("window_variants", [])
+    win_rows = []
+    for w_days in window_variants:
+        sel = select_within_window(base_scored, snap_epoch, w_days, top_n)
+        win_rows.append(
+            (w_days, len(sel), _jaccard(base_set, {r["number"] for r in sel}))
+        )
+
     lines = [
         "# Sensitivity report",
         "",
         f"- run_id: `{run_id}`",
+        "",
+        "## (a) Weight perturbation",
+        "",
         f"- perturbation: +/-{pert:.0%} per weight (12 variants)",
         f"- **min overlap: {headline_min:.3f}**, mean overlap: {headline_mean:.3f}",
         "",
@@ -333,6 +342,21 @@ def _sensitivity(conn, cfg, run_id, out_dir) -> None:
     ]
     for key, label, j in rows:
         lines.append(f"| {key} | {label} | {j:.3f} |")
+
+    lines += [
+        "",
+        "## (b) Creation-window variants",
+        "",
+        "Baseline imposes **no** calendar window; each variant restricts selection "
+        "to issues created within N days of the snapshot. High overlap = the window "
+        "choice would not have changed the selection.",
+        "",
+        "| window (days) | selected | Jaccard vs no-window baseline |",
+        "|---|---|---|",
+    ]
+    for w_days, n_sel, j in win_rows:
+        lines.append(f"| {w_days} | {n_sel} | {j:.3f} |")
+
     with open(os.path.join(out_dir, "sensitivity.md"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
 

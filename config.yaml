@@ -1,8 +1,4 @@
 repo: anthropics/claude-code
-window:
-  created_days: 90            # pool: created within N days of snapshot_ts
-  carveout_updated_days: 45   # OR older but updated within N days
-  carveout_min_reactions: 25  # OR older but holding >= N reactions
 weights:
   reactions: 3.0
   comments: 1.0
@@ -42,6 +38,7 @@ selection:
     min_age_days: 7
 sensitivity:
   perturbation: 0.5           # +/-50% per weight
+  window_variants: [90, 180]  # days-since-creation cutoffs, tested in-memory only
 qc:
   cluster_sample: 20
   seed: 42

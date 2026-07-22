@@ -6,3 +6,4 @@ data/retrieval.db
 out/
 reports/
 .pytest_cache/
+*.log

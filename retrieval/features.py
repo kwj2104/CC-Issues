@@ -170,17 +170,12 @@ def run_features(conn: sqlite3.Connection, cfg: dict) -> int:
         "reactions_total, author_association, active_lock_reason FROM issues"
     ).fetchall()
 
-    created_days = cfg["window"]["created_days"]
-    carve_updated = cfg["window"]["carveout_updated_days"]
-    carve_reactions = cfg["window"]["carveout_min_reactions"]
-
     inserts = []
     for r in rows:
         number = r["number"]
         labels = labels_by_number.get(number, set())
         prepped = prep_text(r["title"], r["body"], body_lead_chars)
         created_epoch = _parse_iso_epoch(r["created_at"])
-        updated_epoch = _parse_iso_epoch(r["updated_at"])
         age = age_days(snap_epoch, created_epoch)
 
         fr = f_reactions(r["reactions_total"])
@@ -193,13 +188,10 @@ def run_features(conn: sqlite3.Connection, cfg: dict) -> int:
         )
         maintainer = compute_maintainer_authored(r["author_association"])
 
-        age_created = (snap_epoch - created_epoch) / 86400.0
-        age_updated = (snap_epoch - updated_epoch) / 86400.0
-        in_pool = int(
-            age_created <= created_days
-            or age_updated <= carve_updated
-            or r["reactions_total"] >= carve_reactions
-        )
+        # rev 3: no calendar window — every open issue is in the baseline pool.
+        # Maintainers' own lifecycle labels (via exclude_labels) define staleness;
+        # window_variants are explored only inside the sensitivity report.
+        in_pool = 1
         lock_reason = (r["active_lock_reason"] or "").lower()
         eligible = int(
             bool(in_pool)

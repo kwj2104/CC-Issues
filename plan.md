@@ -1,5 +1,13 @@
-# plan.md — GitHub Issue Opportunity Retrieval (Stage 1) — rev 2
+# plan.md — GitHub Issue Opportunity Retrieval (Stage 1) — rev 3
 
+> **rev 3 delta (remove time window).** Supersedes the pool definition only;
+> everything else from rev 2 stands. Deletes the `window:` block — `in_pool = 1`
+> for every open issue. The maintainers' own lifecycle automation (stale at 14d
+> inactivity unless ≥10 👍, autoclose 14d later) already defines a live issue, and
+> we inherit that policy through `exclude_labels` rather than imposing a calendar
+> window. `sensitivity.window_variants: [90, 180]` exists to prove empirically that
+> no window choice would have changed the selection. Touches §3, §4, §8, §9.
+>
 > **rev 2 delta (eligibility filtering upgrade).** Adds a `question` label
 > exclusion, lock-reason exclusion, a junk filter for abandoned empty reports,
 > and a maintainer-authored flag (flag only — never affects eligibility or
@@ -65,10 +73,7 @@ Each stage is independently re-runnable: `migrate`, `features`, `score`, `report
 
 ```yaml
 repo: anthropics/claude-code
-window:
-  created_days: 90          # pool: created within N days of snapshot_ts
-  carveout_updated_days: 45 # OR older but updated within N days
-  carveout_min_reactions: 25 # OR older but holding >= N reactions
+# rev 3: the `window:` block was deleted — in_pool = 1 for every open issue.
 weights:
   reactions: 3.0
   comments: 1.0
@@ -108,6 +113,7 @@ selection:
     min_age_days: 7
 sensitivity:
   perturbation: 0.5         # ±50% per weight
+  window_variants: [90, 180] # rev 3: creation-day cutoffs, tested in-memory only
 qc:
   cluster_sample: 20
   seed: 42
@@ -195,13 +201,7 @@ CREATE TABLE IF NOT EXISTS scores (
 );
 ```
 
-**Pool filter** (computed into `features.in_pool`, so the window is a query, not a code path):
-
-```sql
-julianday(meta.snapshot_ts) - julianday(issues.created_at) <= 90
-OR julianday(meta.snapshot_ts) - julianday(issues.updated_at) <= 45
-OR issues.reactions_total >= 25
-```
+**Pool filter (rev 3):** there is no date predicate. `features.in_pool = 1` for every open issue (the ingest layer only stores `state=open` rows). The `in_pool` column is retained — the baseline is always `1` — so downstream queries and the eligibility formula are unchanged. Creation-day windows live **only** inside the sensitivity analysis (§8b), computed in memory; they never touch the baseline pool.
 
 ## 5. M2 — Features
 
@@ -256,7 +256,7 @@ score = w.reactions*f_reactions + w.comments*f_comments + w.velocity*f_velocity
 ## 8. M4 — Diagnostics (`report`)
 
 1. `reports/composition.md` (+ a machine-readable `.csv` twin): pool size and carve-out share; top-1,000 vs full-pool distributions of age buckets (≤7d, 8–30d, 31–90d, >90d), bug/enhancement/other label mix, top-15 `area:*` labels, engagement deciles; count of selected issues admitted **only** via carve-out. **(rev 2)** an **exclusion waterfall** with counts at every step: open snapshot → in_pool → after each `exclude_label` (count per label) → after lock-reason filter → after junk filter → eligible (each step's remaining ≤ the previous; final remaining = the features-table eligible count); plus the count of `maintainer_authored` rows inside the top 1,000.
-2. `reports/sensitivity.md`: for each of the 6 weights, re-rank with that weight ×0.5 and ×1.5 (12 variants; selection re-run in memory, no DB writes) → table of Jaccard overlaps between each variant's top-1,000 and the baseline's. Include min/mean overlap headline.
+2. `reports/sensitivity.md`, **(a) weight perturbation**: for each of the 6 weights, re-rank with that weight ×0.5 and ×1.5 (12 variants; selection re-run in memory, no DB writes) → table of Jaccard overlaps between each variant's top-1,000 and the baseline's. Include min/mean overlap headline. **(b) creation-window variants (rev 3):** re-run selection restricted to issues created within each `sensitivity.window_variants` value (90 and 180 days) of `snapshot_ts`; report the Jaccard overlap of each variant's top-1,000 against the **no-window baseline**. High overlap is the empirical proof that no window choice would have changed the selection.
 3. `reports/top20_preview.md`: rank, number, title, score components, link — the human sanity check before Stage 2 commits.
 4. `reports/cluster_qc.md`: per §6.5.
 
@@ -264,7 +264,7 @@ score = w.reactions*f_reactions + w.comments*f_comments + w.velocity*f_velocity
 
 1. `python -m retrieval all` completes against the live repo with only `GITHUB_TOKEN` set; ingest ≤ ~20 min, post-ingest ≤ 5 min, ≤ 2 GB RAM.
 2. Ingested row count within ±1% of the search-API `total_count`; both values stored in `meta` and printed.
-3. `top_1000.csv` has exactly `top_n` rows; all `number`s unique; **at most one row per `cluster_id`**; every row satisfies the pool predicate. **(rev 2)** no selected row carries an excluded label, an excluded lock reason, or `is_junk = 1`.
+3. `top_1000.csv` has exactly `top_n` rows; all `number`s unique; **at most one row per `cluster_id`**; every row is `state=open` (rev 3: replaces the former pool-predicate check). **(rev 2)** no selected row carries an excluded label, an excluded lock reason, or `is_junk = 1`.
 4. Determinism: running `score` + `report` twice on the same DB and config produces byte-identical `top_1000.csv` (verify by hash in a test).
 5. Unit tests: text prep (fixture strings → expected clean output); each feature formula against hand-computed values on the ~30-row fixture; union-find clustering on a fixture with two known duplicate groups; selection logic incl. tie-breaks and cluster dedup; severity cap and regex once-only bonus. **(rev 2)** `is_junk` boundaries (clean_body 39/40/41 chars; age 6.9 vs 7.0; exactly 1 reaction or 1 comment is not junk); `maintainer_authored` mapping for each `author_association`; lock-reason exclusion (spam/resolved excluded; other/NULL kept); waterfall counts sum consistently (each step ≤ previous; eligible matches the features table); the determinism hash covers the new CSV column.
 6. All 12 sensitivity variants generated; `composition.md` renders with real numbers.

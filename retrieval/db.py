@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS features (
   f_demand    REAL NOT NULL,       -- per section 5
   is_junk            INTEGER NOT NULL,  -- abandoned empty report (all junk conds hold)
   maintainer_authored INTEGER NOT NULL, -- author is OWNER/MEMBER/COLLABORATOR (flag only)
-  in_pool  INTEGER NOT NULL,       -- window/carve-out predicate
+  in_pool  INTEGER NOT NULL,       -- rev 3: always 1 (baseline = every open issue)
   eligible INTEGER NOT NULL        -- in_pool AND labels AND lock reason AND NOT junk
 );
 

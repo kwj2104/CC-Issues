@@ -99,21 +99,16 @@ def test_demand_requires_label(loaded):
 # --- pool + eligibility ----------------------------------------------------
 
 
-def test_carveout_updated_recently(loaded):
-    # 501: >90d old but updated 12d ago -> in pool, eligible.
-    assert _feat(loaded, 501, "in_pool") == 1
-    assert _feat(loaded, 501, "eligible") == 1
+def test_baseline_in_pool_is_always_one(loaded):
+    # rev 3: no calendar window -> every open issue is in the baseline pool.
+    rows = loaded.execute("SELECT in_pool FROM features").fetchall()
+    assert rows and all(r["in_pool"] == 1 for r in rows)
 
 
-def test_carveout_high_reactions(loaded):
-    # 502: >90d old, stale, but 30 reactions >= 25 -> in pool.
-    assert _feat(loaded, 502, "in_pool") == 1
-
-
-def test_ancient_issue_excluded_from_pool(loaded):
-    # 503: >90d, not recently updated, 1 reaction -> out of pool.
-    assert _feat(loaded, 503, "in_pool") == 0
-    assert _feat(loaded, 503, "eligible") == 0
+def test_old_issue_now_in_pool_and_eligible(loaded):
+    # 503 was window-excluded under rev 2; rev 3 keeps it (open, no bad label).
+    assert _feat(loaded, 503, "in_pool") == 1
+    assert _feat(loaded, 503, "eligible") == 1
 
 
 def test_excluded_label_not_eligible(loaded):

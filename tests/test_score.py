@@ -6,7 +6,8 @@ import csv
 import hashlib
 import os
 
-from retrieval import score
+from retrieval import db, report, score
+from retrieval.features import _parse_iso_epoch
 
 
 def _run(loaded, cfg, out_dir):
@@ -69,19 +70,14 @@ def test_no_junk_or_excluded_lock_selected(loaded, cfg, tmp_path):
         assert (lock or "").lower() not in exclude_lock
 
 
-def test_every_selected_is_in_pool(loaded, cfg, tmp_path):
+def test_every_selected_is_open(loaded, cfg, tmp_path):
+    # rev 3: acceptance is state=open (all ingested issues), not a pool predicate.
     _run(loaded, cfg, tmp_path)
     for r in _read(tmp_path, "top_1000.csv"):
-        in_pool = loaded.execute(
-            "SELECT in_pool FROM features WHERE number = ?", (int(r["number"]),)
-        ).fetchone()["in_pool"]
-        assert in_pool == 1
-
-
-def test_ancient_issue_never_selected(loaded, cfg, tmp_path):
-    _run(loaded, cfg, tmp_path)
-    numbers = {r["number"] for r in _read(tmp_path, "top_1000.csv")}
-    assert "503" not in numbers  # out of pool
+        state = loaded.execute(
+            "SELECT state FROM issues WHERE number = ?", (int(r["number"]),)
+        ).fetchone()["state"]
+        assert state == "open"
 
 
 def test_ranked_pool_sorted_by_score_desc(loaded, cfg, tmp_path):
@@ -100,6 +96,23 @@ def test_determinism_byte_identical(loaded, cfg, tmp_path):
         ha = hashlib.sha256((a / name).read_bytes()).hexdigest()
         hb = hashlib.sha256((b / name).read_bytes()).hexdigest()
         assert ha == hb, f"{name} not byte-identical across runs"
+
+
+def test_window_variant_selections_valid(loaded, cfg):
+    # rev 3: each window variant must yield a valid selection — dedup-compliant,
+    # <= top_n, every member eligible and created within the window.
+    scored = score._load_scored_rows(loaded, cfg["weights"])
+    top_n = cfg["selection"]["top_n"]
+    snap_epoch = _parse_iso_epoch(db.get_meta(loaded, "snapshot_ts"))
+    for w_days in cfg["sensitivity"]["window_variants"]:
+        sel = report.select_within_window(scored, snap_epoch, w_days, top_n)
+        assert len(sel) <= top_n
+        cluster_ids = [r["cluster_id"] for r in sel]
+        assert len(cluster_ids) == len(set(cluster_ids))  # one per cluster
+        for r in sel:
+            assert r["eligible"] == 1
+            age = (snap_epoch - _parse_iso_epoch(r["created_at"])) / 86400.0
+            assert age <= w_days
 
 
 def test_scores_table_ranks_eligible_only(loaded, cfg, tmp_path):
