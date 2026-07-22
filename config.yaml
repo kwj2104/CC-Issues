@@ -1,4 +1,6 @@
 repo: anthropics/claude-code
+ingest:
+  count_tolerance: 0.03       # |ingested - search total_count| / total_count; search count is approximate
 weights:
   reactions: 3.0
   comments: 1.0

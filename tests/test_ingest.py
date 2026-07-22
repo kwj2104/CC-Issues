@@ -83,6 +83,17 @@ def test_lock_fields_captured():
     assert parsed["active_lock_reason"] == "spam"
 
 
+def test_count_tolerance():
+    # search total_count is approximate; 3% default accommodates the divergence.
+    ok, drift = ingest.count_within_tolerance(11866, 12103, 0.03)
+    assert ok and abs(drift - 0.0196) < 1e-3
+    # a truncated pull (the offset-cap bug) is ~19% -> flagged.
+    ok, _ = ingest.count_within_tolerance(9776, 12103, 0.03)
+    assert not ok
+    # no usable API total -> trivially ok.
+    assert ingest.count_within_tolerance(100, 0, 0.03) == (True, 0.0)
+
+
 def test_lock_fields_absent_default():
     parsed = ingest.parse_issue(
         {

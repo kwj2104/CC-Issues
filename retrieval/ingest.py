@@ -15,6 +15,23 @@ API_ROOT = "https://api.github.com"
 RAW_ROOT = os.path.join("data", "raw")
 PER_PAGE = 100
 MAX_RETRIES = 5
+# Cursor sentinel for "start of backlog". We OMIT the `since` param on the first
+# fetch rather than passing an epoch date: GitHub returns an empty array for
+# `since=1970-01-01T00:00:00Z`, but with no `since` and sort=updated&asc it
+# returns the genuinely oldest-updated open issues, which is what we want.
+INITIAL_CURSOR = None
+# Search `total_count` is approximate and runs a few percent above the actual
+# open-issue list, so ±1% was unachievable on a full ingest. 3% still flags a
+# genuinely broken/truncated pull (the offset-cap bug gave ~19%).
+DEFAULT_COUNT_TOLERANCE = 0.03
+
+
+def count_within_tolerance(row_count: int, api_total: int, tol: float):
+    """Return (ok, drift). Trivially ok when the API gave no usable total."""
+    if api_total <= 0:
+        return True, 0.0
+    drift = abs(row_count - api_total) / api_total
+    return drift <= tol, drift
 
 
 # --- Network fetch ---------------------------------------------------------
@@ -59,30 +76,59 @@ def _get(session, url: str, params: dict, token: str):
     raise RuntimeError(f"giving up on {url} after {MAX_RETRIES} attempts")
 
 
-def _fetch_pages(session, repo: str, token: str, raw_path: str,
-                 checkpoint_path: str, start_page: int) -> int:
-    """Paginate the issues endpoint, appending kept rows to raw_path.
+def _fetch_issues(session, repo: str, token: str, raw_path: str,
+                  checkpoint_path: str, cursor: str, seen: set) -> str:
+    """Cursor-paginate the issues endpoint by `updated_at` ascending.
 
-    Returns the last page fetched. Skips rows carrying a `pull_request` key.
+    GitHub's REST **offset** pagination is capped (page*per_page beyond ~10k
+    returns 422), so we page with the `since` cursor instead of `page`, which
+    walks the full backlog regardless of size. `since` is inclusive, so the
+    boundary rows reappear each step; `seen` (persisted across resume by
+    replaying the raw file) drops them, keeping the raw layer append-only and
+    every issue written exactly once. Returns the final cursor. Skips PRs.
     """
     url = f"{API_ROOT}/repos/{repo}/issues"
-    page = start_page
     while True:
-        params = {"state": "open", "per_page": PER_PAGE, "page": page}
+        params = {
+            "state": "open",
+            "sort": "updated",
+            "direction": "asc",
+            "per_page": PER_PAGE,
+        }
+        if cursor is not None:  # omit `since` at start (epoch returns [] on GitHub)
+            params["since"] = cursor
         resp = _get(session, url, params, token)
         items = resp.json()
         if not items:
             break
+        new_count = 0
+        max_updated = cursor
         with open(raw_path, "a", encoding="utf-8") as fh:
             for item in items:
+                num = item.get("number")
+                upd = item.get("updated_at")
+                if upd is not None and (max_updated is None or upd > max_updated):
+                    max_updated = upd
+                if num in seen:
+                    continue
+                seen.add(num)
                 if "pull_request" in item:
                     continue  # endpoint interleaves PRs
                 fh.write(json.dumps(item, ensure_ascii=False) + "\n")
+                new_count += 1
         with open(checkpoint_path, "w", encoding="utf-8") as fh:
-            json.dump({"last_page": page, "done": False}, fh)
-        print(f"[ingest] page {page}: {len(items)} rows")
-        page += 1
-    return page - 1
+            json.dump(
+                {"cursor": max_updated, "count": len(seen), "done": False}, fh
+            )
+        print(f"[ingest] since {cursor} -> {max_updated}: {len(items)} fetched, "
+              f"{new_count} new (total seen {len(seen)})")
+        if max_updated == cursor:
+            # A full page shares the cursor timestamp; `since` cannot advance
+            # without offset paging (capped). Vanishingly rare on real repos.
+            print(f"[ingest] WARNING: cursor stalled at {cursor}; stopping.")
+            break
+        cursor = max_updated
+    return cursor
 
 
 def _validate_count(session, repo: str, token: str) -> int:
@@ -204,7 +250,7 @@ def run_ingest(conn: sqlite3.Connection, cfg: dict) -> dict:
     repo = cfg["repo"]
 
     # Resume support: reuse an in-progress snapshot dir if a checkpoint exists.
-    snapshot_ts, snapshot_date, start_page = _resolve_snapshot(repo)
+    snapshot_ts, snapshot_date, start_cursor = _resolve_snapshot(repo)
     raw_dir = os.path.join(RAW_ROOT, snapshot_date)
     os.makedirs(raw_dir, exist_ok=True)
     raw_path = os.path.join(raw_dir, "issues.jsonl")
@@ -214,12 +260,20 @@ def run_ingest(conn: sqlite3.Connection, cfg: dict) -> dict:
         with open(meta_path, "w", encoding="utf-8") as fh:
             json.dump({"snapshot_ts": snapshot_ts, "repo": repo}, fh)
 
+    # On resume, replay the already-written raw rows so we never re-append them.
+    seen: set = set()
+    if os.path.exists(raw_path):
+        for row in _read_raw(raw_path):
+            num = row.get("number")
+            if num is not None:
+                seen.add(num)
+
     session = requests.Session()
-    last_page = _fetch_pages(
-        session, repo, token, raw_path, checkpoint_path, start_page
+    final_cursor = _fetch_issues(
+        session, repo, token, raw_path, checkpoint_path, start_cursor, seen
     )
     with open(checkpoint_path, "w", encoding="utf-8") as fh:
-        json.dump({"last_page": last_page, "done": True}, fh)
+        json.dump({"cursor": final_cursor, "count": len(seen), "done": True}, fh)
 
     api_total = _validate_count(session, repo, token)
 
@@ -229,13 +283,15 @@ def run_ingest(conn: sqlite3.Connection, cfg: dict) -> dict:
     row_count = result["row_count"]
     print(f"[ingest] ingested {row_count} issues; API total_count {api_total}; "
           f"malformed {result['malformed_count']}")
+    tol = cfg.get("ingest", {}).get("count_tolerance", DEFAULT_COUNT_TOLERANCE)
+    ok, drift = count_within_tolerance(row_count, api_total, tol)
+    if not ok:
+        raise SystemExit(
+            f"row_count {row_count} vs api_total_count {api_total} exceeds "
+            f"{tol:.0%} tolerance ({drift:.3%})"
+        )
     if api_total > 0:
-        drift = abs(row_count - api_total) / api_total
-        if drift > 0.01:
-            raise SystemExit(
-                f"row_count {row_count} vs api_total_count {api_total} "
-                f"exceeds 1% tolerance ({drift:.3%})"
-            )
+        print(f"[ingest] count drift {drift:.3%} within {tol:.0%} tolerance")
     return result
 
 
@@ -266,8 +322,8 @@ def run_migrate(conn: sqlite3.Connection, cfg: dict) -> dict:
     return result
 
 
-def _resolve_snapshot(repo: str) -> tuple[str, str, int]:
-    """Pick or resume today's snapshot. Returns (snapshot_ts, date, start_page)."""
+def _resolve_snapshot(repo: str) -> tuple[str, str, str]:
+    """Pick or resume today's snapshot. Returns (snapshot_ts, date, start_cursor)."""
     now = datetime.now(timezone.utc)
     snapshot_date = now.strftime("%Y-%m-%d")
     raw_dir = os.path.join(RAW_ROOT, snapshot_date)
@@ -278,7 +334,7 @@ def _resolve_snapshot(repo: str) -> tuple[str, str, int]:
             snapshot_ts = json.load(fh)["snapshot_ts"]
         with open(checkpoint_path, encoding="utf-8") as fh:
             cp = json.load(fh)
-        if cp.get("done"):
-            return snapshot_ts, snapshot_date, cp["last_page"] + 1
-        return snapshot_ts, snapshot_date, cp["last_page"] + 1
-    return now.isoformat(), snapshot_date, 1
+        # Resume from the stored cursor (rewinds slightly; `seen` dedups the
+        # overlap). A stale pre-rev-4 checkpoint has no cursor -> start over.
+        return snapshot_ts, snapshot_date, cp.get("cursor", INITIAL_CURSOR)
+    return now.isoformat(), snapshot_date, INITIAL_CURSOR

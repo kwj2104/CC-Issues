@@ -1,5 +1,18 @@
-# plan.md — GitHub Issue Opportunity Retrieval (Stage 1) — rev 3
+# plan.md — GitHub Issue Opportunity Retrieval (Stage 1) — rev 5
 
+> **rev 5 delta (count tolerance).** GitHub's search `total_count` is
+> approximate and ran ~2% above the actual open-issue list, so the ±1%
+> validation tolerance was unachievable on a *complete* ingest (it failed at
+> 11,866 vs 12,103). Made the tolerance configurable (`ingest.count_tolerance`,
+> default ±3%) — still catches a broken/truncated pull (~19%). Touches §4, §9.
+>
+> **rev 4 delta (cursor pagination).** GitHub's REST offset pagination (`page=N`)
+> is capped at ~10k items (422 beyond), and this repo's open backlog is larger,
+> so rev 1's "paginate until an empty page" silently truncated the ingest at
+> ~9.8k of ~12k. Switched to `since`-cursor pagination (updated-at ascending)
+> with a `seen`-set dedup, which walks the full backlog at any size. Touches §4,
+> §10; no change to any post-ingest stage.
+>
 > **rev 3 delta (remove time window).** Supersedes the pool definition only;
 > everything else from rev 2 stands. Deletes the `window:` block — `in_pool = 1`
 > for every open issue. The maintainers' own lifecycle automation (stale at 14d
@@ -121,14 +134,14 @@ qc:
 
 ## 4. M1 — Ingest
 
-**Endpoint:** `GET https://api.github.com/repos/{repo}/issues?state=open&per_page=100&page=N` with headers `Authorization: Bearer $GITHUB_TOKEN`, `Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28`.
+**Endpoint:** `GET https://api.github.com/repos/{repo}/issues?state=open&sort=updated&direction=asc&since=<cursor>&per_page=100` with headers `Authorization: Bearer $GITHUB_TOKEN`, `Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28`.
 
 Rules:
 
-1. Paginate until an empty page. **Skip any row containing a `pull_request` key** (the endpoint interleaves PRs).
-2. Append each kept item as one JSON line (verbatim API object) to `data/raw/<YYYY-MM-DD>/issues.jsonl`. The raw layer is append-only and never edited. Maintain a `checkpoint.json` (last completed page) alongside it so an interrupted ingest resumes rather than restarts; a completed ingest finalizes the snapshot.
-3. Rate limits: read `X-RateLimit-Remaining`/`X-RateLimit-Reset`; if remaining < 10, sleep until reset. On 403/429 sleep 60s and retry (max 5); on 5xx exponential backoff 5s→80s (max 5); on persistent failure exit nonzero with the page number.
-4. After pagination, make **one** validation call to `GET /search/issues?q=repo:{repo}+type:issue+state:open&per_page=1` and compare `total_count` with rows ingested. Tolerance ±1% (state changes mid-ingest). Outside tolerance → exit nonzero with both numbers.
+1. **Cursor pagination (rev 4).** GitHub's REST **offset** pagination is capped — `page × per_page` beyond ~10,000 items returns `422 Unprocessable Entity` — and this repo's open backlog exceeds that. So page with the **`since` cursor** (updated-at, ascending) instead of `page=N`: start at `1970-01-01T00:00:00Z`, and after each fetch advance the cursor to the max `updated_at` seen. `since` is inclusive, so boundary rows reappear; a `seen` set (rebuilt by replaying the raw file on resume) drops them, so each issue is written exactly once. Terminate on an empty page (or a stalled cursor — a full page all sharing one timestamp, which is vanishingly rare). **Skip any row containing a `pull_request` key** (the endpoint interleaves PRs). *(rev 1 used `page=N` until an empty page; that silently truncates any repo with >10k open issues+PRs.)*
+2. Append each kept item as one JSON line (verbatim API object) to `data/raw/<YYYY-MM-DD>/issues.jsonl`. The raw layer is append-only and never edited. Maintain a `checkpoint.json` (`{cursor, count, done}`) alongside it so an interrupted ingest resumes from the last cursor rather than restarts; a completed ingest finalizes the snapshot.
+3. Rate limits: read `X-RateLimit-Remaining`/`X-RateLimit-Reset`; if remaining < 10, sleep until reset. On 403/429 sleep 60s and retry (max 5); on 5xx exponential backoff 5s→80s (max 5); on persistent failure exit nonzero with the failing cursor.
+4. After pagination, make **one** validation call to `GET /search/issues?q=repo:{repo}+type:issue+state:open&per_page=1` and compare `total_count` with rows ingested. Tolerance `ingest.count_tolerance` (**rev 5: default ±3%**, was ±1%). Outside tolerance → exit nonzero with both numbers. *(Empirically the search `total_count` runs ~2% above the actual open-issue list — it is approximate and eventually-consistent — so ±1% was unachievable on a complete ingest; ±3% still catches a genuinely broken/truncated pull, e.g. the offset-cap bug's ~19%.)*
 5. Load into SQLite (schema below): parse timestamps as UTC ISO-8601 strings; `body` may be null → store `''`; lowercase all label names; `reactions_total` = `reactions.total_count`, `reactions_plus1` = `reactions["+1"]`; capture `locked` (absent → 0) and `active_lock_reason` (absent → NULL). Store `snapshot_ts` (UTC now, once) and config snapshot in `meta`.
 
 **Migration (rev 2):** columns added after the initial release (`issues.locked`, `issues.active_lock_reason`, `features.is_junk`, `features.maintainer_authored`) are patched into pre-existing DBs idempotently via `ALTER TABLE ADD COLUMN`. Because the raw JSONL layer already stores the full API objects, `migrate` **replays the loader from `data/raw/<date>/issues.jsonl`** (preserving the stored `snapshot_ts`/`api_total_count`) rather than re-fetching — the frozen snapshot must stay the same snapshot.
@@ -263,7 +276,7 @@ score = w.reactions*f_reactions + w.comments*f_comments + w.velocity*f_velocity
 ## 9. Acceptance criteria
 
 1. `python -m retrieval all` completes against the live repo with only `GITHUB_TOKEN` set; ingest ≤ ~20 min, post-ingest ≤ 5 min, ≤ 2 GB RAM.
-2. Ingested row count within ±1% of the search-API `total_count`; both values stored in `meta` and printed.
+2. Ingested row count within `ingest.count_tolerance` (rev 5: ±3%) of the search-API `total_count`; both values stored in `meta` and printed.
 3. `top_1000.csv` has exactly `top_n` rows; all `number`s unique; **at most one row per `cluster_id`**; every row is `state=open` (rev 3: replaces the former pool-predicate check). **(rev 2)** no selected row carries an excluded label, an excluded lock reason, or `is_junk = 1`.
 4. Determinism: running `score` + `report` twice on the same DB and config produces byte-identical `top_1000.csv` (verify by hash in a test).
 5. Unit tests: text prep (fixture strings → expected clean output); each feature formula against hand-computed values on the ~30-row fixture; union-find clustering on a fixture with two known duplicate groups; selection logic incl. tie-breaks and cluster dedup; severity cap and regex once-only bonus. **(rev 2)** `is_junk` boundaries (clean_body 39/40/41 chars; age 6.9 vs 7.0; exactly 1 reaction or 1 comment is not junk); `maintainer_authored` mapping for each `author_association`; lock-reason exclusion (spam/resolved excluded; other/NULL kept); waterfall counts sum consistently (each step ≤ previous; eligible matches the features table); the determinism hash covers the new CSV column.
@@ -276,7 +289,7 @@ score = w.reactions*f_reactions + w.comments*f_comments + w.velocity*f_velocity
 - Issues with zero age (created seconds before snapshot) → `age_days` floor 1.0.
 - Label names containing spaces and colons (`has repro`, `area:security`) — always compare lowercased, exact string.
 - The list endpoint occasionally returns transferred/deleted issues as 404 stubs mid-pagination — skip malformed rows, count them, report in `meta`.
-- Pagination termination: empty page, not `Link` header parsing (simpler and sufficient).
+- Pagination termination (rev 4): empty page or a stalled `since` cursor. Offset `page=N` is unusable past ~10k items (GitHub returns 422), so the `since` cursor is mandatory, not an optimization.
 - Reactions object missing (rare) → all reaction fields 0.
 - Duplicate `number` across pages (issue state changed mid-ingest, page shift) → last write wins in SQLite (`INSERT OR REPLACE`), raw JSONL keeps both lines.
 - A cluster whose highest-scoring member is ineligible (e.g., labeled `duplicate`) — the cluster is represented by its highest-scoring *eligible* member; ineligible members still contribute to `cluster_size`.
