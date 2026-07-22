@@ -11,7 +11,8 @@ import statistics
 from . import config as config_mod
 from . import db
 from .features import _parse_iso_epoch
-from .score import _load_scored_rows, _rank_and_select, compile_filter
+from .score import (_load_scored_rows, _rank_and_select, compile_filter,
+                    select_lanes)
 
 REPORTS_DIR = "reports"
 
@@ -104,11 +105,24 @@ def _exclusion_waterfall(pool, labels_by, cfg, total_open, reactions_by, stale_m
 # --- lane diagnostics (rev 6) ----------------------------------------------
 
 
+def _eng_dominated(r) -> bool:
+    """True if raw engagement (c_reactions+c_comments) is the largest score part."""
+    comps = {
+        "engagement": r["c_reactions"] + r["c_comments"],
+        "velocity": r["c_velocity"],
+        "severity": r["c_severity"],
+        "demand": r["c_demand"],
+        "cluster": r["c_cluster"],
+    }
+    return max(comps, key=comps.get) == "engagement"
+
+
 def _lane_diagnostics(conn, cfg, run_id):
-    """Per-lane fills/medians + a lane-filter overlap matrix. Returns (md, csv)."""
+    """Per-lane fills/medians/eng-dominance + a lane-filter overlap matrix."""
     sel = conn.execute(
-        "SELECT s.number, s.selection_lane, f.age_days, f.rate_score, "
-        "f.f_severity, c.cluster_size, i.reactions_total "
+        "SELECT s.number, s.selection_lane, s.c_reactions, s.c_comments, "
+        "s.c_velocity, s.c_severity, s.c_demand, s.c_cluster, "
+        "f.age_days, f.rate_score, f.f_severity, c.cluster_size, i.reactions_total "
         "FROM scores s JOIN features f ON f.number = s.number "
         "JOIN clusters c ON c.number = s.number "
         "JOIN issues i ON i.number = s.number "
@@ -127,20 +141,35 @@ def _lane_diagnostics(conn, cfg, run_id):
                for name in order}
 
     md = ["", "## Per-lane composition", "",
-          "| lane | fill | median age_days | median rate_score | median severity |",
-          "|---|---|---|---|---|"]
+          "| lane | fill | median age_days | median rate_score | median severity "
+          "| eng-dominated % |",
+          "|---|---|---|---|---|---|"]
     csv_rows = []
+    flags = []
     for name in order:
         g = by_lane.get(name, [])
         if not g:
-            md.append(f"| {name} | 0 | - | - | - |")
+            md.append(f"| {name} | 0 | - | - | - | - |")
             csv_rows.append(("lane_fill", name, 0))
             continue
         ma = statistics.median([x["age_days"] for x in g])
         mr = statistics.median([x["rate_score"] for x in g])
         ms = statistics.median([x["f_severity"] for x in g])
-        md.append(f"| {name} | {len(g)} | {ma:.1f} | {mr:.2f} | {ms:.2f} |")
+        eng_frac = sum(1 for x in g if _eng_dominated(x)) / len(g)
+        md.append(f"| {name} | {len(g)} | {ma:.1f} | {mr:.2f} | {ms:.2f} | "
+                  f"{eng_frac:.0%} |")
         csv_rows.append(("lane_fill", name, len(g)))
+        csv_rows.append(("lane_eng_dominated_frac", name, f"{eng_frac:.4f}"))
+        # big-bets ranks by raw score, so its engagement dominance is by design;
+        # a rate/severity/cluster lane going >90% engagement is the real signal.
+        if name != "big-bets" and eng_frac > 0.9:
+            flags.append(
+                f"> **FLAG:** lane `{name}` is {eng_frac:.0%} engagement-dominated "
+                f"despite ranking by rate/severity/cluster — age-correction may not "
+                f"be separating it from raw engagement."
+            )
+    if flags:
+        md += ["", *flags]
 
     lanes = cfg["selection"]["lanes"]
     preds = {lane["name"]: compile_filter(lane.get("filter")) for lane in lanes}
@@ -215,54 +244,37 @@ def _composition(conn, cfg, run_id, out_dir) -> None:
                 area_counts[l] = area_counts.get(l, 0) + 1
     top_areas = sorted(area_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:15]
 
-    # engagement deciles over the pool; where do the selected fall?
+    # Engagement deciles over the pool, where do the selected fall?
+    # rev 4.1: rank-based percentiles (average-rank of the tie group) instead of
+    # value cut-points, so heavy ties (e.g. engagement 0) don't silently collapse
+    # deciles. Equal engagement -> equal decile; the note below quantifies it.
+    import bisect
+
     eng = sorted((r["reactions_total"] + r["comments"]) for r in pool)
-    bounds = [eng[min(len(eng) - 1, (len(eng) * d) // 10)] for d in range(1, 10)] if eng else []
+    n_pool = len(eng)
 
     def decile(v):
-        d = 0
-        for b in bounds:
-            if v > b:
-                d += 1
-        return d
+        lo = bisect.bisect_left(eng, v)
+        hi = bisect.bisect_right(eng, v)
+        avg_rank = (lo + hi - 1) / 2.0        # 0-based average rank of the ties
+        return min(9, int((avg_rank + 0.5) / n_pool * 10)) if n_pool else 0
 
     sel_deciles: dict[int, int] = {}
     for r in selected:
-        sel_deciles[decile(r["reactions_total"] + r["comments"])] = (
-            sel_deciles.get(decile(r["reactions_total"] + r["comments"]), 0) + 1
-        )
+        d = decile(r["reactions_total"] + r["comments"])
+        sel_deciles[d] = sel_deciles.get(d, 0) + 1
+
+    # Quantify the tie-collapse: modal engagement value and where it maps.
+    zero_share = (eng.count(0) / n_pool) if n_pool else 0.0
+    modal_decile = decile(0)
+    decile_note = (
+        f"Rank-based deciles (ties share a decile). **{zero_share:.0%}** of the pool "
+        f"has engagement 0 -> all map to decile {modal_decile}, so lower deciles are "
+        f"empty by construction."
+    )
 
     age_keys = ["<=7d", "8-30d", "31-90d", ">90d"]
     class_keys = ["bug", "enhancement", "other"]
-
-    pure_engagement_note = ""
-    # crude head-purity check: fraction of top-100 whose top component is engagement
-    head = conn.execute(
-        """
-        SELECT c_reactions, c_comments, c_velocity, c_severity, c_demand, c_cluster
-        FROM scores WHERE run_id = ? AND selected = 1
-        ORDER BY rank ASC LIMIT 100
-        """,
-        (run_id,),
-    ).fetchall()
-    if head:
-        eng_dom = 0
-        for h in head:
-            comps = {
-                "engagement": h["c_reactions"] + h["c_comments"],
-                "velocity": h["c_velocity"],
-                "severity": h["c_severity"],
-                "demand": h["c_demand"],
-                "cluster": h["c_cluster"],
-            }
-            if max(comps, key=comps.get) == "engagement":
-                eng_dom += 1
-        frac = eng_dom / len(head)
-        if frac > 0.9:
-            pure_engagement_note = (
-                f"\n> **FLAG:** {frac:.0%} of the top 100 are engagement-dominated "
-                f"picks; cluster/severity/velocity are barely moving the head.\n"
-            )
 
     lines = [
         "# Composition report",
@@ -274,7 +286,7 @@ def _composition(conn, cfg, run_id, out_dir) -> None:
         f"- selected (top_n): **{len(selected)}**",
         f"- maintainer-authored rows inside top_n: **{maintainer_in_top}** "
         f"(flag only; not excluded)",
-        pure_engagement_note,
+        "",
         "## Exclusion waterfall",
         "",
         f"- **stale rescued** (kept despite `stale`, >= {stale_min} reactions): "
@@ -317,6 +329,7 @@ def _composition(conn, cfg, run_id, out_dir) -> None:
         lines.append(f"| {name} | {n} |")
 
     lines += ["", "## Engagement deciles of selected (0=lowest, 9=highest)", "",
+              decile_note, "",
               "| decile | selected |", "|---|---|"]
     for d in range(10):
         lines.append(f"| {d} | {sel_deciles.get(d, 0)} |")
@@ -372,24 +385,39 @@ def _jaccard(a: set, b: set) -> float:
     return len(a & b) / len(a | b)
 
 
-def select_within_window(scored, snap_epoch, window_days, top_n):
-    """Re-run selection restricted to issues created within `window_days`."""
+def _lane_head(scored, sel_cfg) -> set:
+    """Numbers of the full lane portfolio (lanes + spill + cluster dedup)."""
+    selected, _, _ = select_lanes(scored, sel_cfg)
+    return {r["number"] for r in selected}
+
+
+def select_within_window(scored, snap_epoch, window_days, sel_cfg):
+    """Full lane selection restricted to issues created within `window_days`."""
     subset = [
         r for r in scored
         if (snap_epoch - _parse_iso_epoch(r["created_at"])) / 86400.0 <= window_days
     ]
-    _, selected = _rank_and_select(subset, top_n)
+    selected, _, _ = select_lanes(subset, sel_cfg)
     return selected
 
 
 def _sensitivity(conn, cfg, run_id, out_dir) -> None:
     weights = cfg["weights"]
-    top_n = cfg["selection"]["top_n"]
+    sel_cfg = cfg["selection"]
     pert = cfg["sensitivity"]["perturbation"]
 
+    # rev 4.1: every variant re-runs the FULL lane portfolio and compares to the
+    # current run's lane head (not the retired single-score head).
     base_scored = _load_scored_rows(conn, weights)
-    _, base_selected = _rank_and_select(base_scored, top_n)
-    base_set = {r["number"] for r in base_selected}
+    base_set = _lane_head(base_scored, sel_cfg)
+
+    # Sanity: an unperturbed re-run must reproduce the baseline head exactly.
+    unpert = _lane_head(_load_scored_rows(conn, weights), sel_cfg)
+    sanity = _jaccard(base_set, unpert)
+    if sanity != 1.0:
+        raise RuntimeError(
+            f"sensitivity harness broken: unperturbed Jaccard {sanity} != 1.0"
+        )
 
     # (a) weight perturbation
     rows = []
@@ -397,21 +425,18 @@ def _sensitivity(conn, cfg, run_id, out_dir) -> None:
         for factor, label in ((1 - pert, "x0.5"), (1 + pert, "x1.5")):
             w = dict(weights)
             w[key] = weights[key] * factor
-            scored = _load_scored_rows(conn, w)
-            _, selected = _rank_and_select(scored, top_n)
-            rows.append((key, label, _jaccard(base_set, {r["number"] for r in selected})))
+            head = _lane_head(_load_scored_rows(conn, w), sel_cfg)
+            rows.append((key, label, _jaccard(base_set, head)))
 
     overlaps = [j for _, _, j in rows]
     headline_min = min(overlaps) if overlaps else 1.0
     headline_mean = sum(overlaps) / len(overlaps) if overlaps else 1.0
 
-    # (b) creation-window variants (rev 3): does any calendar window change the pick?
-    snapshot_ts = db.get_meta(conn, "snapshot_ts")
-    snap_epoch = _parse_iso_epoch(snapshot_ts)
-    window_variants = cfg["sensitivity"].get("window_variants", [])
+    # (b) creation-window variants: does any calendar window change the pick?
+    snap_epoch = _parse_iso_epoch(db.get_meta(conn, "snapshot_ts"))
     win_rows = []
-    for w_days in window_variants:
-        sel = select_within_window(base_scored, snap_epoch, w_days, top_n)
+    for w_days in cfg["sensitivity"].get("window_variants", []):
+        sel = select_within_window(base_scored, snap_epoch, w_days, sel_cfg)
         win_rows.append(
             (w_days, len(sel), _jaccard(base_set, {r["number"] for r in sel}))
         )
@@ -420,13 +445,16 @@ def _sensitivity(conn, cfg, run_id, out_dir) -> None:
         "# Sensitivity report",
         "",
         f"- run_id: `{run_id}`",
+        f"- baseline = the current run's **lane head** ({len(base_set)} rows); "
+        f"every variant re-runs the full lane portfolio",
+        f"- unperturbed sanity: Jaccard vs baseline = **{sanity:.3f}** (must be 1.000)",
         "",
         "## (a) Weight perturbation",
         "",
         f"- perturbation: +/-{pert:.0%} per weight (12 variants)",
         f"- **min overlap: {headline_min:.3f}**, mean overlap: {headline_mean:.3f}",
         "",
-        "| weight | variant | Jaccard vs baseline top_n |",
+        "| weight | variant | Jaccard vs baseline lane head |",
         "|---|---|---|",
     ]
     for key, label, j in rows:
@@ -436,9 +464,9 @@ def _sensitivity(conn, cfg, run_id, out_dir) -> None:
         "",
         "## (b) Creation-window variants",
         "",
-        "Baseline imposes **no** calendar window; each variant restricts selection "
-        "to issues created within N days of the snapshot. High overlap = the window "
-        "choice would not have changed the selection.",
+        "Baseline imposes **no** calendar window; each variant restricts the lane "
+        "portfolio to issues created within N days of the snapshot. High overlap = "
+        "the window choice would not have changed the selection.",
         "",
         "| window (days) | selected | Jaccard vs no-window baseline |",
         "|---|---|---|",

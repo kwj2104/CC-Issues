@@ -111,7 +111,7 @@ def test_window_variant_selections_valid(loaded, cfg):
     top_n = cfg["selection"]["top_n"]
     snap_epoch = _parse_iso_epoch(db.get_meta(loaded, "snapshot_ts"))
     for w_days in cfg["sensitivity"]["window_variants"]:
-        sel = report.select_within_window(scored, snap_epoch, w_days, top_n)
+        sel = report.select_within_window(scored, snap_epoch, w_days, cfg["selection"])
         assert len(sel) <= top_n
         cluster_ids = [r["cluster_id"] for r in sel]
         assert len(cluster_ids) == len(set(cluster_ids))  # one per cluster
